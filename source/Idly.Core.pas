@@ -14,7 +14,14 @@ unit idly_core;
 interface
 
 uses
-  SysUtils, Classes, sockets, baseunix, linux; // Added linux unit for epoll
+  SysUtils, Classes, sockets, baseunix
+  {$IFDEF LINUX}
+  , linux // Native epoll for Debian/Linux
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  , kqueue // Native kqueue for macOS
+  {$ENDIF}
+  ;
 
 type
   PConnectionContext = ^TConnectionContext;
@@ -27,10 +34,24 @@ type
 
   TIdlyEngine = class
   private
-    FEpollFD: Integer;
     FActiveConnections: TFPList;
     FRunning: Boolean;
-    procedure HandleNewConnection(ListenFD: TSocket);
+    
+    // Platform-dependent properties
+    {$IFDEF LINUX}
+    FEpollFD: Integer;
+    {$ENDIF}
+    {$IFDEF DARWIN}
+    FKQueueFD: Integer;
+    {$ENDIF}
+    {$IFNDEF LINUX}
+      {$IFNDEF DARWIN}
+      FMasterSet: TFDSet;
+      FReadSet: TFDSet;
+      FMaxFD: TSocket;
+      {$ENDIF}
+    {$ENDIF}
+
     procedure HandleClientActivity(Context: PConnectionContext);
     procedure CloseConnection(Context: PConnectionContext);
   public
@@ -45,20 +66,40 @@ implementation
 
 constructor TIdlyEngine.Create;
 begin
-  // Create the epoll instance
-  FEpollFD := epoll_create(1);
-  if FEpollFD = -1 then
-    raise Exception.Create('Failed to initialize epoll context.');
-    
   FActiveConnections := TFPList.Create;
   FRunning := False;
+
+  {$IFDEF LINUX}
+  FEpollFD := epoll_create(1);
+  if FEpollFD = -1 then raise Exception.Create('Failed to initialize epoll context.');
+  {$ENDIF}
+
+  {$IFDEF DARWIN}
+  FKQueueFD := kqueue();
+  if FKQueueFD = -1 then raise Exception.Create('Failed to initialize kqueue context.');
+  {$ENDIF}
+
+  {$IFNDEF LINUX}
+    {$IFNDEF DARWIN}
+    fpFD_ZERO(FMasterSet);
+    FMaxFD := 0;
+    {$ENDIF}
+  {$ENDIF}
 end;
 
 destructor TIdlyEngine.Destroy;
 begin
   Stop;
   FActiveConnections.Free;
+  
+  {$IFDEF LINUX}
   if FEpollFD <> -1 then fpClose(FEpollFD);
+  {$ENDIF}
+  
+  {$IFDEF DARWIN}
+  if FKQueueFD <> -1 then fpClose(FKQueueFD);
+  {$ENDIF}
+  
   inherited Destroy;
 end;
 
@@ -67,7 +108,12 @@ var
   ServerFD: TSocket;
   Addr: TInetSockAddr;
   OptVal: LongInt;
+  {$IFDEF LINUX}
   EV: tepoll_event;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  EV: struct_kevent;
+  {$ENDIF}
 begin
   ServerFD := fpSocket(AF_INET, SOCK_STREAM, 0);
   if ServerFD = -1 then Exit;
@@ -83,43 +129,97 @@ begin
   begin
     if fpListen(ServerFD, 128) = 0 then
     begin
-      // Set server listening socket to non-blocking
       fpSetSockOpt(ServerFD, SOL_SOCKET, SO_NONBLOCK, @OptVal, SizeOf(OptVal));
-      
-      // Register server socket with epoll for read events (EPOLLIN)
+
+      {$IFDEF LINUX}
       EV.events := EPOLLIN;
-      EV.data.fd := ServerFD; // Target descriptor
-      
-      if epoll_ctl(FEpollFD, EPOLL_CTL_ADD, ServerFD, @EV) < 0 then
-        raise Exception.Create('Failed to add server socket to epoll.');
+      EV.data.fd := ServerFD;
+      epoll_ctl(FEpollFD, EPOLL_CTL_ADD, ServerFD, @EV);
+      {$ENDIF}
+
+      {$IFDEF DARWIN}
+      EV.ident := ServerFD;
+      EV.filter := EVFILT_READ;
+      EV.flags := EV_ADD or EV_ENABLE;
+      EV.fflags := 0;
+      EV.data := 0;
+      EV.udata := nil;
+      kevent(FKQueueFD, @EV, 1, nil, 0, nil);
+      {$ENDIF}
+
+      {$IFNDEF LINUX}
+        {$IFNDEF DARWIN}
+        fpFD_SET(ServerFD, FMasterSet);
+        if ServerFD > FMaxFD then FMaxFD := ServerFD;
+        {$ENDIF}
+      {$ENDIF}
     end;
   end;
 end;
 
 procedure TIdlyEngine.Run;
 var
-  EventBuffer: array[0..63] of tepoll_event; // Batch up to 64 events per cycle
-  ReadyCount: Integer;
   i: Integer;
+  ReadyCount: Integer;
   Context: PConnectionContext;
+  {$IFDEF LINUX}
+  EventBuffer: array[0..63] of tepoll_event;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  EventBuffer: array[0..63] of struct_kevent;
+  TimeoutSpec: timespec;
+  {$ENDIF}
+  {$IFNDEF LINUX}
+    {$IFNDEF DARWIN}
+    TimeoutVal: TTimeVal;
+    {$ENDIF}
+  {$ENDIF}
 begin
   FRunning := True;
   while FRunning do
   begin
-    // 100ms timeout window to keep the loop responsive to termination flags
-    ReadyCount := epoll_wait(FEpollFD, @EventBuffer[0], 64, 100);
-
+    {$IFDEF LINUX}
+    ReadyCount := epoll_wait(FEpollFD, @EventBuffer, 64, 100);
     for i := 0 to ReadyCount - 1 do
     begin
-      // If the event matches a listening server socket, you would call HandleNewConnection.
-      // For existing clients, data.ptr holds our specific Context record pointer.
       if (EventBuffer[i].events and EPOLLIN) <> 0 then
       begin
-        // If it is an active client tracking its context layout:
         Context := PConnectionContext(EventBuffer[i].data.ptr);
-        HandleClientActivity(Context);
+        if Context <> nil then HandleClientActivity(Context);
       end;
     end;
+    {$ENDIF}
+
+    {$IFDEF DARWIN}
+    TimeoutSpec.tv_sec := 0;
+    TimeoutSpec.tv_nsec := 100000000; // 100ms
+    ReadyCount := kevent(FKQueueFD, nil, 0, @EventBuffer, 64, @TimeoutSpec);
+    for i := 0 to ReadyCount - 1 do
+    begin
+      if EventBuffer[i].filter = EVFILT_READ then
+      begin
+        Context := PConnectionContext(EventBuffer[i].udata);
+        if Context <> nil then HandleClientActivity(Context);
+      end;
+    end;
+    {$ENDIF}
+
+    {$IFNDEF LINUX}
+      {$IFNDEF DARWIN}
+      FReadSet := FMasterSet;
+      TimeoutVal.tv_sec := 0;
+      TimeoutVal.tv_usec := 100000;
+      ReadyCount := fpSelect(FMaxFD + 1, @FReadSet, nil, nil, @TimeoutVal);
+      if ReadyCount > 0 then
+      begin
+        for i := FActiveConnections.Count - 1 downto 0 do
+        begin
+          Context := PConnectionContext(FActiveConnections[i]);
+          if fpFD_ISSET(Context^.FD, FReadSet) <> 0 then HandleClientActivity(Context);
+        end;
+      end;
+      {$ENDIF}
+    {$ENDIF}
   end;
 end;
 
@@ -128,18 +228,26 @@ var
   BytesRead: Integer;
 begin
   BytesRead := fpRecv(Context^.FD, @Context^.Buffer[Context^.BufLen], SizeOf(Context^.Buffer) - Context^.BufLen, 0);
-  
   if BytesRead <= 0 then
-  begin
     CloseConnection(Context);
-  end;
 end;
 
 procedure TIdlyEngine.CloseConnection(Context: PConnectionContext);
 begin
-  // Linux automatically drops FDs from epoll sets on close, 
-  // but explicitly calling EPOLL_CTL_DEL protects state consistency.
+  {$IFDEF LINUX}
   epoll_ctl(FEpollFD, EPOLL_CTL_DEL, Context^.FD, nil);
+  {$ENDIF}
+  
+  {$IFDEF DARWIN}
+  // kqueue automatically removes closing descriptors
+  {$ENDIF}
+  
+  {$IFNDEF LINUX}
+    {$IFNDEF DARWIN}
+    fpFD_CLR(Context^.FD, FMasterSet);
+    {$ENDIF}
+  {$ENDIF}
+
   fpClose(Context^.FD);
   FActiveConnections.Remove(Context);
   Dispose(Context);
