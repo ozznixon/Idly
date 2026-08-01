@@ -1,5 +1,5 @@
 (* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *)
-(*  Filename: Idly.Types.pas                                         *)
+(*  Filename: IdlyServer.pas                                         *)
 (* Copyright: (C) 2026 by Brain Patchwork DX, LLC. build 1260801     *)
 (* ================================================================= *)
 (* Even though I author DXSock, a commercial socket suite ~ this was *)
