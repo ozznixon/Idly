@@ -13,6 +13,8 @@ This unit defines the interface that all future RFC handlers must implement. Thi
 
 ## Phase 2: The Network Engine (Idly.Core.pas)
 A lightweight, non-blocking engine wrapper. To add an RFC to your application, you simply register its handler to a port.
+* The Core Multi-Protocol Loop Structure
+The infrastructure relies on managing a master socket descriptor set (TFDSet). The loop monitors all listening servers and active client connections simultaneously inside a non-blocking execution cycle.
 
 ## Phase 3: Implementing an RFC Example (Idly.RFC865.pas)
 To prove scalability, here is a mock implementation of RFC 865 (Quote of the Day Protocol) using the Idly pattern.
