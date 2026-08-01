@@ -51,6 +51,9 @@ type
 
 implementation
 
+Uses
+   Math; {Min}
+
 constructor TIdlyNodelistCompiler.Create(const TargetBinaryFile: string);
 begin
   FOutStream := TFileStream.Create(TargetBinaryFile, fmCreate);
