@@ -16,12 +16,11 @@ interface
 uses
   SysUtils, Classes, sockets, baseunix
   {$IFDEF LINUX}, linux{$ENDIF}
-  {$IFDEF DARWIN}, kqueue{$ENDIF};
+  {$IFDEF DARWIN}, kqueue{$ENDIF}; // Exposes struct_kevent and kevent() on macOS
 
 type
-  TIdlyEngine = class; // Forward declaration
+  TIdlyEngine = class;
 
-  // Abstract base class for protocol-specific connection contexts
   TIdlyConnection = class
   public
     FD: TSocket;
@@ -29,18 +28,14 @@ type
     BufLen: Integer;
     constructor Create(AFileDescriptor: TSocket); virtual;
     destructor Destroy; override;
-    // Core event triggered when raw data arrives on the socket
     procedure HandleRead; virtual; abstract;
   end;
-  TIdlyConnectionClass = class of TIdlyConnection;
 
-  // Interface that plugins implement to handle handshakes on a specific port
   IIdlyProtocolFactory = interface
     ['{8F4E67A2-1234-5678-ABCD-EF1234567890}']
     function CreateConnection(ClientFD: TSocket): TIdlyConnection;
   end;
 
-  // The engine registry mapping record
   TListenerBinding = record
     Port: Word;
     ServerFD: TSocket;
@@ -58,20 +53,17 @@ type
 
     procedure HandleNewConnection(ListenFD: TSocket; const Factory: IIdlyProtocolFactory);
     procedure CloseConnection(Connection: TIdlyConnection);
+    function IsListenerFD(AValue: TSocket; out OutFactory: IIdlyProtocolFactory): Boolean;
   public
     constructor Create;
     destructor Destroy; override;
-    // Register any server plugin cleanly without core modifications
     procedure RegisterProtocol(Port: Word; const Factory: IIdlyProtocolFactory);
     procedure Run;
     procedure Stop;
   end;
 
 implementation
-{  Implement the Decoupled Connection Handler (Idly.Core.pas)
 
-   Update the engine's internal HandleNewConnection and event loop processing to act completely agnostic of the protocol type.
-}
 constructor TIdlyConnection.Create(AFileDescriptor: TSocket);
 begin
   FD := AFileDescriptor;
@@ -79,9 +71,56 @@ begin
   FillChar(Buffer, SizeOf(Buffer), 0);
 end;
 
-destructor TIdlyConnection.Destroy;
+destructor TIdlyConnection.Destroy; begin inherited Destroy; end;
+
+constructor TIdlyEngine.Create;
 begin
+  FActiveConnections := TFPList.Create;
+  FRunning := False;
+
+  {$IFDEF LINUX}
+  FEpollFD := epoll_create(1);
+  if FEpollFD = -1 then raise Exception.Create('Failed to initialize epoll.');
+  {$ENDIF}
+
+  {$IFDEF DARWIN}
+  FKQueueFD := kqueue();
+  if FKQueueFD = -1 then raise Exception.Create('Failed to initialize kqueue.');
+  {$ENDIF}
+
+  {$IFNDEF LINUX}{$IFNDEF DARWIN}
+  fpFD_ZERO(FMasterSet);
+  FMaxFD := 0;
+  {$ENDIF}{$ENDIF}
+end;
+
+destructor TIdlyEngine.Destroy;
+var
+  i: Integer;
+begin
+  Stop;
+  for i := FActiveConnections.Count - 1 downto 0 do
+    CloseConnection(TIdlyConnection(FActiveConnections[i]));
+  FActiveConnections.Free;
+
+  {$IFDEF LINUX}if FEpollFD <> -1 then fpClose(FEpollFD);{$ENDIF}
+  {$IFDEF DARWIN}if FKQueueFD <> -1 then fpClose(FKQueueFD);{$ENDIF}
   inherited Destroy;
+end;
+
+function TIdlyEngine.IsListenerFD(AValue: TSocket; out OutFactory: IIdlyProtocolFactory): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(FBindings) do
+  begin
+    if FBindings[i].ServerFD = AValue then
+    begin
+      OutFactory := FBindings[i].Factory;
+      Exit(True);
+    end;
+  end;
 end;
 
 procedure TIdlyEngine.RegisterProtocol(Port: Word; const Factory: IIdlyProtocolFactory);
@@ -117,17 +156,25 @@ begin
 
       {$IFDEF LINUX}
       EV.events := EPOLLIN;
-      EV.data.fd := ServerFD; // Using fd tracking for listener endpoints
+      EV.data.fd := ServerFD;
       epoll_ctl(FEpollFD, EPOLL_CTL_ADD, ServerFD, @EV);
       {$ENDIF}
 
       {$IFDEF DARWIN}
+      // Configure kqueue event for the incoming socket listener
       EV.ident := ServerFD;
       EV.filter := EVFILT_READ;
       EV.flags := EV_ADD or EV_ENABLE;
-      EV.fflags := 0; EV.data := 0; EV.udata := nil;
-      kevent(FKQueueFD, @EV, 1, nil, 0, nil);
+      EV.fflags := 0; EV.data := 0; 
+      EV.udata := nil; // Explicitly nil out udata to label it a server hook
+      if kevent(FKQueueFD, @EV, 1, nil, 0, nil) < 0 then
+        raise Exception.Create('kqueue failed to bind server socket.');
       {$ENDIF}
+
+      {$IFNDEF LINUX}{$IFNDEF DARWIN}
+      fpFD_SET(ServerFD, FMasterSet);
+      if ServerFD > FMaxFD then FMaxFD := ServerFD;
+      {$ENDIF}{$ENDIF}
     end;
   end;
 end;
@@ -149,34 +196,59 @@ begin
   OptVal := 1;
   fpSetSockOpt(ClientFD, SOL_SOCKET, SO_NONBLOCK, @OptVal, SizeOf(OptVal));
 
-  // The factory creates the class instance mapping the correct protocol states
   Connection := Factory.CreateConnection(ClientFD);
   FActiveConnections.Add(Connection);
 
   {$IFDEF LINUX}
   EV.events := EPOLLIN or EPOLLET;
-  EV.data.ptr := Connection; // Pass instance object pointer straight through
+  EV.data.ptr := Connection;
   epoll_ctl(FEpollFD, EPOLL_CTL_ADD, ClientFD, @EV);
   {$ENDIF}
 
   {$IFDEF DARWIN}
+  // Register client connection to trigger read loops
   EV.ident := ClientFD;
   EV.filter := EVFILT_READ;
-  EV.flags := EV_ADD or EV_ENABLE;
+  EV.flags := EV_ADD or EV_ENABLE or EV_CLEAR; // EV_CLEAR acts as edge-triggered behavior
   EV.fflags := 0; EV.data := 0;
-  EV.udata := Connection;
+  EV.udata := Connection; // Pass connection object reference straight into kqueue
   kevent(FKQueueFD, @EV, 1, nil, 0, nil);
   {$ENDIF}
+
+  {$IFNDEF LINUX}{$IFNDEF DARWIN}
+  fpFD_SET(ClientFD, FMasterSet);
+  if ClientFD > FMaxFD then FMaxFD := ClientFD;
+  {$ENDIF}{$ENDIF}
+end;
+
+procedure TIdlyEngine.CloseConnection(Connection: TIdlyConnection);
+begin
+  {$IFDEF LINUX}epoll_ctl(FEpollFD, EPOLL_CTL_DEL, Connection.FD, nil);{$ENDIF}
+  // Note: macOS kqueue automatically purges closed descriptors from its queue arrays
+  
+  {$IFNDEF LINUX}{$IFNDEF DARWIN}
+  fpFD_CLR(Connection.FD, FMasterSet);
+  {$ENDIF}{$ENDIF}
+
+  fpClose(Connection.FD);
+  FActiveConnections.Remove(Connection);
+  Connection.Free;
 end;
 
 procedure TIdlyEngine.Run;
 var
-  i, j: Integer;
+  i: Integer;
   ReadyCount: Integer;
-  IsListener: Boolean;
+  MatchedFactory: IIdlyProtocolFactory;
   ConnectionInstance: TIdlyConnection;
   {$IFDEF LINUX}EventBuffer: array[0..63] of tepoll_event;{$ENDIF}
-  {$IFDEF DARWIN}EventBuffer: array[0..63] of struct_kevent; TimeoutSpec: timespec;{$ENDIF}
+  {$IFDEF DARWIN}
+  EventBuffer: array[0..63] of struct_kevent;
+  TimeoutSpec: timespec;
+  {$ENDIF}
+  {$IFNDEF LINUX}{$IFNDEF DARWIN}
+  TimeoutVal: TTimeVal; j: Integer;
+  {$ENDIF}{$ENDIF}
 begin
   FRunning := True;
   while FRunning do
@@ -187,19 +259,9 @@ begin
     begin
       if (EventBuffer[i].events and EPOLLIN) <> 0 then
       begin
-        IsListener := False;
-        // Verify if event comes from a registered listening server socket
-        for j := 0 to High(FBindings) do
-        begin
-          if FBindings[j].ServerFD = EventBuffer[i].data.fd then
-          begin
-            HandleNewConnection(FBindings[j].ServerFD, FBindings[j].Factory);
-            IsListener := True;
-            Break;
-          end;
-        end;
-
-        if not IsListener then
+        if IsListenerFD(EventBuffer[i].data.fd, MatchedFactory) then
+          HandleNewConnection(EventBuffer[i].data.fd, MatchedFactory)
+        else
         begin
           ConnectionInstance := TIdlyConnection(EventBuffer[i].data.ptr);
           if ConnectionInstance <> nil then ConnectionInstance.HandleRead;
@@ -207,21 +269,56 @@ begin
       end;
     end;
     {$ENDIF}
+
+    {$IFDEF DARWIN}
+    TimeoutSpec.tv_sec := 0;
+    TimeoutSpec.tv_nsec := 100000000; // 100ms cycle timeout window
+    ReadyCount := kevent(FKQueueFD, nil, 0, @EventBuffer, 64, @TimeoutSpec);
     
-    // (Implement corresponding branches for MacOS kqueue and generic select equivalents...)
+    for i := 0 to ReadyCount - 1 do
+    begin
+      // Filter out connection drops or standard errors explicitly
+      if (EventBuffer[i].flags and EV_ERROR) <> 0 then Continue;
+
+      if EventBuffer[i].filter = EVFILT_READ then
+      begin
+        // If udata is nil, this event signifies an incoming listener endpoint action
+        if EventBuffer[i].udata = nil then
+        begin
+          if IsListenerFD(EventBuffer[i].ident, MatchedFactory) then
+            HandleNewConnection(EventBuffer[i].ident, MatchedFactory);
+        end
+        else
+        begin
+          // Safely cast udata straight back into our connection object model
+          ConnectionInstance := TIdlyConnection(EventBuffer[i].udata);
+          ConnectionInstance.HandleRead;
+        end;
+      end;
+    end;
+    {$ENDIF}
+
+    {$IFNDEF LINUX}{$IFNDEF DARWIN}
+    FReadSet := FMasterSet; TimeoutVal.tv_sec := 0; TimeoutVal.tv_usec := 100000;
+    ReadyCount := fpSelect(FMaxFD + 1, @FReadSet, nil, nil, @TimeoutVal);
+    if ReadyCount > 0 then
+    begin
+      for i := 0 to High(FBindings) do
+      begin
+        if fpFD_ISSET(FBindings[i].ServerFD, FReadSet) <> 0 then
+          HandleNewConnection(FBindings[i].ServerFD, FBindings[i].Factory);
+      end;
+      for j := FActiveConnections.Count - 1 downto 0 do
+      begin
+        ConnectionInstance := TIdlyConnection(FActiveConnections[j]);
+        if fpFD_ISSET(ConnectionInstance.FD, FReadSet) <> 0 then
+          ConnectionInstance.HandleRead;
+      end;
+    end;
+    {$ENDIF}{$ENDIF}
   end;
 end;
 
-procedure TIdlyEngine.CloseConnection(Connection: TIdlyConnection);
-begin
-  {$IFDEF LINUX}epoll_ctl(FEpollFD, EPOLL_CTL_DEL, Connection^.FD, nil);{$ENDIF}
-  fpClose(Connection.FD);
-  FActiveConnections.Remove(Connection);
-  Connection.Free;
-end;
-
 procedure TIdlyEngine.Stop; begin FRunning := False; end;
-constructor TIdlyEngine.Create; begin FActiveConnections := TFPList.Create; FRunning := False; {$IFDEF LINUX}FEpollFD := epoll_create(1);{$ENDIF} end;
-destructor TIdlyEngine.Destroy; begin FActiveConnections.Free; inherited Destroy; end;
 
 end.
