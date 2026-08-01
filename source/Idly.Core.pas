@@ -14,7 +14,7 @@ unit idly_core;
 interface
 
 uses
-  SysUtils, Classes, sockets, baseunix;
+  SysUtils, Classes, sockets, baseunix, linux; // Added linux unit for epoll
 
 type
   PConnectionContext = ^TConnectionContext;
@@ -23,15 +23,12 @@ type
     ProtocolHandler: TProcedure(Context: PConnectionContext) of object;
     Buffer: array[0..4095] of Byte;
     BufLen: Integer;
-    // Protocol-specific state variables go here
   end;
 
   TIdlyEngine = class
   private
-    FMasterSet: TFDSet;
-    FReadSet: TFDSet;
-    FMaxFD: TSocket;
-    FActiveConnections: TFPList; // Stores PConnectionContext
+    FEpollFD: Integer;
+    FActiveConnections: TFPList;
     FRunning: Boolean;
     procedure HandleNewConnection(ListenFD: TSocket);
     procedure HandleClientActivity(Context: PConnectionContext);
@@ -48,20 +45,20 @@ implementation
 
 constructor TIdlyEngine.Create;
 begin
-  fpFD_ZERO(FMasterSet);
+  // Create the epoll instance
+  FEpollFD := epoll_create(1);
+  if FEpollFD = -1 then
+    raise Exception.Create('Failed to initialize epoll context.');
+    
   FActiveConnections := TFPList.Create;
-  FMaxFD := 0;
   FRunning := False;
 end;
 
 destructor TIdlyEngine.Destroy;
-var
-  i: Integer;
 begin
   Stop;
-  for i := 0 to FActiveConnections.Count - 1 do
-    Dispose(PConnectionContext(FActiveConnections[i]));
   FActiveConnections.Free;
+  if FEpollFD <> -1 then fpClose(FEpollFD);
   inherited Destroy;
 end;
 
@@ -70,6 +67,7 @@ var
   ServerFD: TSocket;
   Addr: TInetSockAddr;
   OptVal: LongInt;
+  EV: tepoll_event;
 begin
   ServerFD := fpSocket(AF_INET, SOCK_STREAM, 0);
   if ServerFD = -1 then Exit;
@@ -85,45 +83,41 @@ begin
   begin
     if fpListen(ServerFD, 128) = 0 then
     begin
-      // Set to non-blocking mode
+      // Set server listening socket to non-blocking
       fpSetSockOpt(ServerFD, SOL_SOCKET, SO_NONBLOCK, @OptVal, SizeOf(OptVal));
-      fpFD_SET(ServerFD, FMasterSet);
-      if ServerFD > FMaxFD then FMaxFD := ServerFD;
+      
+      // Register server socket with epoll for read events (EPOLLIN)
+      EV.events := EPOLLIN;
+      EV.data.fd := ServerFD; // Target descriptor
+      
+      if epoll_ctl(FEpollFD, EPOLL_CTL_ADD, ServerFD, @EV) < 0 then
+        raise Exception.Create('Failed to add server socket to epoll.');
     end;
   end;
 end;
 
 procedure TIdlyEngine.Run;
 var
+  EventBuffer: array[0..63] of tepoll_event; // Batch up to 64 events per cycle
   ReadyCount: Integer;
-  Timeout: TTimeVal;
   i: Integer;
   Context: PConnectionContext;
 begin
   FRunning := True;
   while FRunning do
   begin
-    FReadSet := FMasterSet;
-    
-    // 100ms slice to keep loop responsive to stop flags
-    Timeout.tv_sec := 0;
-    Timeout.tv_usec := 100000; 
+    // 100ms timeout window to keep the loop responsive to termination flags
+    ReadyCount := epoll_wait(FEpollFD, @EventBuffer[0], 64, 100);
 
-    ReadyCount := fpSelect(FMaxFD + 1, @FReadSet, nil, nil, @Timeout);
-
-    if ReadyCount > 0 then
+    for i := 0 to ReadyCount - 1 do
     begin
-      // 1. Check for incoming server socket connections
-      // (Iterate through known listening sockets registered in FMasterSet)
-      
-      // 2. Iterate backwards through active client descriptors to handle data
-      for i := FActiveConnections.Count - 1 downto 0 do
+      // If the event matches a listening server socket, you would call HandleNewConnection.
+      // For existing clients, data.ptr holds our specific Context record pointer.
+      if (EventBuffer[i].events and EPOLLIN) <> 0 then
       begin
-        Context := PConnectionContext(FActiveConnections[i]);
-        if fpFD_ISSET(Context^.FD, FReadSet) <> 0 then
-        begin
-          HandleClientActivity(Context);
-        end;
+        // If it is an active client tracking its context layout:
+        Context := PConnectionContext(EventBuffer[i].data.ptr);
+        HandleClientActivity(Context);
       end;
     end;
   end;
@@ -137,15 +131,16 @@ begin
   
   if BytesRead <= 0 then
   begin
-    // Connection closed by remote host or error occurred
     CloseConnection(Context);
   end;
 end;
 
 procedure TIdlyEngine.CloseConnection(Context: PConnectionContext);
 begin
+  // Linux automatically drops FDs from epoll sets on close, 
+  // but explicitly calling EPOLL_CTL_DEL protects state consistency.
+  epoll_ctl(FEpollFD, EPOLL_CTL_DEL, Context^.FD, nil);
   fpClose(Context^.FD);
-  fpFD_CLR(Context^.FD, FMasterSet);
   FActiveConnections.Remove(Context);
   Dispose(Context);
 end;
